@@ -1,0 +1,3 @@
+z_threshold: 8.0
+window_anomaly_ratio: 0.2
+uptime_acc_threshold: 0.05

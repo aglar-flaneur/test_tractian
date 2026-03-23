@@ -1,0 +1,4 @@
+# Anomaly pipeline hyperparameters
+model_window_size_hours: 4
+engine_window_size_hours: 4
+window_overlap_hours: 2
