@@ -1,44 +1,44 @@
 # Vibration Anomaly Detection - Challenge Report
 
-## Baseline Analysis
-When I first reviewed the `AnomalyModel` and `AlertEngine`, I found a few major problems that limited their performance (Baseline F1: ~0.31, TP: 7, FP: 9, FN: 21):
+## What went wrong in the baseline
+So, taking a look at the given `AnomalyModel` and `AlertEngine`, the baseline F1 score was sitting around 0.31 (7 TP, 9 FP, 21 FN). Basically, it was missing almost everything. 
+Here is a quick breakdown of why it was failing:
 
-1. **Uptime Imbalance**: The original `AnomalyModel.fit()` used all data (both "ON" and "OFF" states) to calculate the mean and standard deviation. Since the machines are often turned off (where the vibration is close to zero), this pulled the mean down and made the standard deviation far too large. This broke the Z-score calculation, causing the model to miss real anomalies (False Negatives) and trigger false alarms during normal operations (False Positives).
-2. **Loss of Directional Data**: The original model combined the X, Y, and Z velocity readings into a single overall number (magnitude). For vibration analysis, specific machine problems (like unbalance) usually happen in specific directions. Combining the axes hides the actual problem. In addition, the original model completely ignored Acceleration data, which is essential to detect high-frequency problems like bearing faults.
-3. **Permanent Alert Locking**: The original `AlertEngine` locked itself permanently after finding the very first anomaly. Because many machines in the dataset have multiple separate incidents over several days, this logic guaranteed that the system would miss all future incidents, resulting in a high number of False Negatives.
-4. **Wrong Timestamp Alignment**: The original model used the end time of the 4-hour window as the anomaly timestamp. When processed inside overlapping 12-hour engine batches, this caused the final timestamp to shift hours away from the real short incidents. This made true alerts fall outside the correct incident time window.
+- **The "OFF" state was ruining the math.** The original `fit()` function just averaged out every single timestamp. Since industrial machines spend half their time turned off, this dragged the standard deviation through the roof and the mean down to near zero. So the Z-scores were totally useless.
+- **Directional data was getting thrown away.** It took X, Y, and Z velocity and just crushed them into one single magnitude. Real faults (like bearing defects) are usually directional. Plus, it just completely ignored acceleration data—which is crazy because acceleration is literally how you detect high-frequency issues.
+- **Permanent locking.** The `AlertEngine` would spot one anomaly and then permanently lock itself. Forever. Since the data has multiple events spread across different days in the same scenario, it just blatantly ignored all the later ones.
+- **Bad timestamps.** Because of the rolling windows, the model kept tagging the *end* of a 4-hour block as the anomaly time. In a 12-hour batch, this pushed alerts hours past the actual event. So they wouldn't overlap the true labels properly.
 
-## Methodology
+## How I fixed it
 
-To fix these issues within the strict rules of the challenge, I made the following changes:
+I didn't want to break the pipeline rules, so I had to be creative with the model internals. 
 
-### 1. Tracking Each Axis Independently
-I updated the `AnomalyModel` to calculate and store the mean and standard deviation for each axis separately (both Acceleration and Velocity). The `predict` function now calculates positive Z-scores for all 6 axes independently. If the vibration on *any* single axis goes above the Z-threshold (which I increased to 8.0 to ignore normal noise), I flag it as an anomaly.
+### 1. Splitting up the axes
+I completely rewrote the `AnomalyModel` to track the mean and std deviation for all 6 axes independently (both Accel and Velocity). When it predicts, it checks the Z-score for each axis on its own. If any single axis spikes past a threshold of 8.0 (which I set really high to filter out natural machine noise), it gets flagged.
 
-### 2. Filtering the "ON" State
-Since the `DataPoint` structure does not come with the `uptime` (ON/OFF) information, I had to find a reliable way to detect it. By looking at the normal data, I saw that the total acceleration consistently drops below `0.05g` when a machine is turned off. I added this `uptime_acc_threshold` to the model. Now, it only calculates statistics and Z-scores when the machine is actually running.
+### 2. Spotting when the machine is actually running
+Since there is no `uptime` flag in the `DataPoint` object, I had to build a workaround. If you look at the raw data, total acceleration drops below `0.05g` whenever the machine stops. I just added an `uptime_acc_threshold` so the model literally ignores data unless the machine is awake. This instantly fixed the math.
 
-### 3. Fixing the `AlertEngine` Logic
-The `AlertEngine` still checks if any prediction in the batch is anomalous. However, I fixed the locking system. Now, it unlocks (`self.locked = False`) as soon as it receives a normal batch with no anomalies. This successfully prevents alert spamming during an ongoing incident but allows the system to alert again if a new incident happens days later. Also, the engine now returns the exact timestamp of the peak anomaly from the window, making sure my alerts correctly overlap the true incident labels.
+### 3. Fixing the Alert Engine
+I kept the batch checking, but I fixed the lockdown issue. Now, the engine unlocks (`self.locked = False`) the moment it sees a clean, healthy batch. This stops alert fatigue during an ongoing breakdown but still lets it catch a new event a few days later. I also made it trace back and return the exact timestamp of the worst local spike, making the labels line up perfectly.
 
-### 4. Advanced Multivariate Testing (Mahalanobis Distance)
-During my tests, I also tried a more advanced Machine Learning approach called Mahalanobis Distance (Multivariate Gaussian). This technique looks at the relationships between all 6 axes at the same time. However, it gave me a worse F1 score than the independent per-axis Z-score. This happens because industrial sensors have normal physical variations over time (sensor drift). These small, natural changes completely messed up the strict math of the Mahalanobis matrix, causing too many false alarms. Treating each axis independently works much better and faster for this type of industrial noise.
+### * Side note on Mahalanobis Distance
+I actually spent some time trying to implement a Multivariate Gaussian Envelope (Mahalanobis Distance) to map the correlations between all the axes. Believe it or not, it performed worse. Industrial sensors drift over time due to wear and tear. That natural drift completely skewed the strict covariance matrix, causing a ton of false alarms. Treating the axes independently was way lighter on the CPU and drastically more reliable.
 
-## Performance
+## Final Results
 
-My improved model gave the following final results:
-- **True Positives**: 13
-- **False Positives**: 11
-- **False Negatives**: 15
-- **Precision**: 0.542
-- **Recall**: 0.464
-- **Global F1 Score**: 0.500
+Here are the hard numbers after the changes:
+- **True Positives:** 13
+- **False Positives:** 11
+- **False Negatives:** 15
+- **Precision:** 0.542
+- **Recall:** 0.464
+- **Global F1 Score:** 0.500
 
-This is a nearly 60% relative improvement over the original F1 score of 0.318. I successfully balanced a big increase in the detection of true anomalies while using a strict Z-threshold to prevent false alarms.
+That is pretty much a 60% relative improvement from the old 0.318 score. 
 
-## Future Work
-
-If I had more time and could change the pipeline structure, I would try:
-- **Rolling Windows Baseline**: Real machines get older and their "normal" behavior changes over time. Using a moving average (like EWMA) would constantly update what "normal" means and prevent old machines from triggering false alarms.
-- **Frequency Domain (FFT)**: Analyzing the sound frequencies (FFT) of the raw 10-minute signals would be much better at isolating specific mechanical faults than just looking at the overall time-domain amplitude.
-- **Machine Learning**: With more labeled data, I could replace the basic Z-score with a lightweight Autoencoder or One-Class SVM. This would help detect complex, non-linear vibration patterns across different axes.
+## If I had more time...
+Assuming I could change the actual data pipeline, I'd probably add:
+- **Rolling Baselines:** Using an EWMA to slowly update the baseline over time. Machines wear out, so their "normal" noise changes. Static Z-scores eventually fail on aging equipment.
+- **FFT Analysis:** Time-domain data is tricky. Crunching the raw signals through a Fast Fourier Transform would highlight the exact fault frequencies much better.
+- **Autoencoders:** If we had more labeled data, swapping this out for an Autoencoder neural net would easily catch non-linear vibration patterns that basic Z-scores miss.
